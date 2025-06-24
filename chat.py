@@ -1,111 +1,89 @@
-# from fastapi import FastAPI, HTTPException
-# from pydantic import BaseModel
-# from sqlalchemy import create_engine, Column, Integer, String, Text
-# from sqlalchemy.orm import sessionmaker, declarative_base
-# import google.generativeai as genai
-# import uuid
+import asyncio
+from datetime import datetime
+from typing import List, AsyncGenerator
 
-# # ==== Gemini AI Setup ====
-# genai.configure(api_key="AIzaSyDwoHNR0OPHd-AfyH_pFeaYllPdi41O9wY")
-# model = genai.GenerativeModel("models/gemini-1.5-flash")
-
-# # ==== PostgreSQL Setup ====
-# DATABASE_URL = "postgresql+psycopg2://postgres:root@localhost/Linda"
-
-# engine = create_engine(DATABASE_URL)
-# SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-# Base = declarative_base()
-
-# class Chat(Base):
-#     __tablename__ = "chats"
-#     id = Column(Integer, primary_key=True, index=True)
-#     session_id = Column(String, unique=True, index=True)
-#     user_message = Column(Text)
-#     bot_response = Column(Text)
-
-# Base.metadata.create_all(bind=engine)
-
-# # ==== FastAPI Init ====
-# app = FastAPI()
-
-# # ==== Pydantic Schema ====
-# class Message(BaseModel):
-#     message: str
-
-# # ==== POST /chat ====
-# @app.post("/chat/")
-# def send_message(msg: Message):
-#     session_id = str(uuid.uuid4())
-
-#     try:
-#         # Get Gemini response
-#         response = model.generate_content(msg.message)
-#         answer = response.text.strip()
-
-#         # Save to DB
-#         db = SessionLocal()
-#         chat = Chat(session_id=session_id, user_message=msg.message, bot_response=answer)
-#         db.add(chat)
-#         db.commit()
-#         db.close()
-
-#         return {"session_id": session_id}
-
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Gemini error: {str(e)}")
-
-# # ==== GET /chat/{session_id} ====
-# @app.get("/chat/{session_id}")
-# def get_response(session_id: str):
-#     db = SessionLocal()
-#     chat = db.query(Chat).filter(Chat.session_id == session_id).first()
-#     db.close()
-
-#     if not chat:
-#         raise HTTPException(status_code=404, detail="Session not found")
-
-#     return {"question": chat.user_message, "answer": chat.bot_response}
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import google.generativeai as genai
+import strawberry
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from strawberry.fastapi import GraphQLRouter
 
 
-# ==== Gemini AI Setup ====
-genai.configure(api_key="AIzaSyDwoHNR0OPHd-AfyH_pFeaYllPdi41O9wY")
-model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
+# In-memory message storage
+messages_db: List["Message"] = []
+subscribers: List[asyncio.Queue] = []
 
-# ==== FastAPI Init ====
+
+@strawberry.type
+class Message:
+    content: str
+    from_user: str
+    to_user: str
+    timestamp: datetime
+
+
+@strawberry.type
+class Query:
+    @strawberry.field
+    def messages(self) -> List[Message]:
+        return messages_db
+
+
+@strawberry.type
+class Mutation:
+    @strawberry.mutation
+    async def send_message(self, content: str, from_user: str, to_user: str) -> Message:
+        message = Message(
+            content=content,
+            from_user=from_user,
+            to_user=to_user,
+            timestamp=datetime.now()
+        )
+        messages_db.append(message)
+
+        # Notify all subscribers
+        for queue in subscribers:
+            await queue.put(message)
+
+        return message
+
+
+@strawberry.type
+class Subscription:
+    @strawberry.subscription
+    async def message_stream(
+        self, from_user: str, to_user: str
+    ) -> AsyncGenerator[Message, None]:
+        queue: asyncio.Queue = asyncio.Queue()
+        subscribers.append(queue)
+
+        try:
+            while True:
+                message: Message = await queue.get()
+                if (
+                    (message.from_user == from_user and message.to_user == to_user)
+                    or
+                    (message.from_user == to_user and message.to_user == from_user)
+                ):
+                    yield message
+        finally:
+            subscribers.remove(queue)
+
+
+# Create schema with query, mutation, and subscription
+schema = strawberry.Schema(query=Query, mutation=Mutation, subscription=Subscription)
+graphql_app = GraphQLRouter(schema)
+
+# Create FastAPI app
 app = FastAPI()
 
-# ==== Pydantic Schema ====
-class Message(BaseModel):
-    message: str
-
-# ==== POST /chat ====
-@app.post("/chat/")
-def send_message(msg: Message):
-    try:
-        # Append instruction to user message
-        modified_message = f"{msg.message.strip()} Please give the answer within one sentence."
-
-        # Send modified message to Gemini
-        response = model.generate_content(modified_message)
-        answer = response.text.strip()
-
-        # Return response to frontendS
-        return {
-            "question": msg.message,
-            "answer": answer
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini error: {str(e)}")
-
+# Add CORS middleware (important for WebSocket & frontend use)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or ["http://localhost:3000"] if you prefer strict
+    allow_origins=["*"],  # In production, use your frontend domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount GraphQL endpoint
+app.include_router(graphql_app, prefix="/graphql")
